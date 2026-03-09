@@ -458,13 +458,22 @@ TArray<FString> PeerIds = DSTM->GetConnectedPeerIds();
 
 ### MultiServer Proxy limitations
 
-The MultiServer Proxy (`UProxyNetDriver`) is **not dynamic**. Its game server list is parsed from `-ProxyGameServers=` at initialization and cannot be changed at runtime. There is no engine API to register or unregister game servers after `InitBase()`. This means:
+The MultiServer Proxy (`UProxyNetDriver`) is **partially dynamic**. Its game server list is typically parsed from `-ProxyGameServers=` during `InitBase()`, but `RegisterGameServer()` is a public method that can be called at any time after initialization to add new game servers.
 
-- All backend game servers must be listed in the proxy's startup command line
-- Adding a new game server requires restarting the proxy
-- If a game server crashes, clients routed to it will be disconnected (the proxy detects the closed connection and cleans up routes)
+**What works without engine changes:**
 
-This is an engine-level limitation in UE 5.7's `UProxyNetDriver`. Dynamic proxy scaling would require Epic to add runtime `RegisterGameServer()` / `UnregisterGameServer()` support.
+- `RegisterGameServer(const FURL&)` can be called post-init — it appends to the `GameServerConnections` array
+- Clients that connect **after** a dynamic registration automatically get routes to the new server (the proxy iterates the full `GameServerConnections` array on each `NMT_Join`)
+- `UProxyNetDriver` is exported (`MULTISERVERREPLICATION_API`) and can be subclassed by plugins
+
+**What does not work (engine limitations):**
+
+- **Existing clients** are not routed to dynamically added servers — `ConnectToGameServer()` is private to `UProxyListenerNotify` and only runs at client join time
+- There is **no `UnregisterGameServer()`** — removing a game server at runtime has no API (no route cleanup, no backend driver teardown)
+- There is **no game server crash detection** — the proxy relies on standard `UIpNetDriver` UDP timeouts with no dedicated callback or reconnection logic
+- If a game server crashes, clients routed to it will eventually be disconnected when the connection times out
+
+Fixing these gaps (retroactive routing for existing clients, server removal, crash hooks) would require engine modifications to `UProxyNetDriver` and `UProxyListenerNotify`.
 
 ### Orchestration notes
 
