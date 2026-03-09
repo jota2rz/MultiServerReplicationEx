@@ -107,9 +107,6 @@ bool UDSTMSubsystem::InitializeFromCommandLine()
 	// Apply DSTM port offset
 	const int32 DSTMListenPort = BaseListenPort + DSTMPortOffset;
 
-	int32 NumServers = 1;
-	FParse::Value(FCommandLine::Get(), TEXT("-MultiServerNumServers="), NumServers);
-
 	FString PeersArg;
 	TArray<FString> BasePeerAddresses;
 	if (FParse::Value(FCommandLine::Get(), TEXT("-MultiServerPeers="), PeersArg, false))
@@ -121,10 +118,10 @@ bool UDSTMSubsystem::InitializeFromCommandLine()
 	TArray<FString> DSTMPeerAddresses = OffsetPeerPorts(BasePeerAddresses, DSTMPortOffset);
 
 	UE_LOG(LogDSTMSub, Log,
-		TEXT("DSTM mesh auto-init: LocalId=%s, DSTMPort=%d (base %d + offset %d), NumServers=%d, Peers=%d"),
-		*LocalPeerId, DSTMListenPort, BaseListenPort, DSTMPortOffset, NumServers, DSTMPeerAddresses.Num());
+		TEXT("DSTM mesh auto-init: LocalId=%s, DSTMPort=%d (base %d + offset %d), Peers=%d"),
+		*LocalPeerId, DSTMListenPort, BaseListenPort, DSTMPortOffset, DSTMPeerAddresses.Num());
 
-	InitializeDSTMMesh(LocalPeerId, ListenIp, DSTMListenPort, NumServers, DSTMPeerAddresses);
+	InitializeDSTMMesh(LocalPeerId, ListenIp, DSTMListenPort, DSTMPeerAddresses);
 
 	// Apply GUID seed if specified (prevents FNetworkGUID collisions between servers)
 	uint64 GuidSeed = 0;
@@ -142,7 +139,6 @@ void UDSTMSubsystem::InitializeDSTMMesh(
 	const FString& LocalPeerId,
 	const FString& ListenIp,
 	int32 ListenPort,
-	int32 NumServers,
 	const TArray<FString>& PeerAddresses)
 {
 	if (DSTMNode)
@@ -159,6 +155,11 @@ void UDSTMSubsystem::InitializeDSTMMesh(
 			TEXT("Cannot initialize DSTM mesh — no World"));
 		return;
 	}
+
+	// Derive expected server count from peer list (peers + self).
+	// This feeds UMultiServerNode::NumExpectedServers, used only by
+	// AreAllServersConnected() as a startup readiness check.
+	const int32 NumServers = PeerAddresses.Num() + 1;
 
 	FMultiServerNodeCreateParams Params;
 	Params.World = World;

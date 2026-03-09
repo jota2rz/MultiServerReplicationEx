@@ -72,10 +72,11 @@ public:
 	/**
 	 * Initialize the DSTM beacon mesh with explicit parameters.
 	 *
+	 * NumServers is derived automatically as PeerAddresses.Num() + 1 (peers + self).
+	 *
 	 * @param LocalPeerId    - This server's unique ID string
 	 * @param ListenIp       - IP to listen on for beacon connections
 	 * @param ListenPort     - Port for DSTM beacon listener
-	 * @param NumServers     - Total expected server count
 	 * @param PeerAddresses  - Array of "IP:Port" for DSTM beacons on other servers
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DSTM")
@@ -83,7 +84,6 @@ public:
 		const FString& LocalPeerId,
 		const FString& ListenIp,
 		int32 ListenPort,
-		int32 NumServers,
 		const TArray<FString>& PeerAddresses);
 
 	/** Is the DSTM mesh active and ready for migration? */

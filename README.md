@@ -140,8 +140,9 @@ Each server process that participates in the DSTM mesh must receive these argume
 | `-MultiServerListenPort=<int>` | Yes | Base port for the main MultiServer mesh. The DSTM mesh listens on this port + 1000. |
 | `-MultiServerListenIp=<ip>` | No | IP address to bind the DSTM beacon listener. Defaults to `0.0.0.0`. |
 | `-MultiServerPeers=<ip:port,...>` | Yes (multi-server) | Comma-separated list of `host:port` pairs for other servers' **main** MultiServer mesh ports. The plugin automatically adds +1000 to each port for the DSTM mesh. |
-| `-MultiServerNumServers=<int>` | No | Total number of servers in the cluster. Used to determine when `AreAllPeersConnected()` returns true. |
 | `-DSTMGuidSeed=<uint64>` | Recommended | GUID allocation seed for the server's `FNetGUIDCache`. Each server must use a distinct value (e.g. `100000`, `200000`) to prevent `FNetworkGUID` collisions in the proxy's shared backend cache. See [GUID Seed](#guid-seed). |
+
+The expected server count for `AreAllPeersConnected()` is derived automatically as `PeerAddresses.Num() + 1` (peers + self). No separate count argument is needed.
 
 ### Example (two-server cluster)
 
@@ -150,14 +151,12 @@ Each server process that participates in the DSTM mesh must receive these argume
 -DedicatedServerId=server-1
 -MultiServerListenPort=15000
 -MultiServerPeers=127.0.0.1:15001
--MultiServerNumServers=2
 -DSTMGuidSeed=100000
 
 # Server 2
 -DedicatedServerId=server-2
 -MultiServerListenPort=15001
 -MultiServerPeers=127.0.0.1:15000
--MultiServerNumServers=2
 -DSTMGuidSeed=200000
 ```
 
@@ -208,7 +207,6 @@ DSTM->InitializeDSTMMesh(
     TEXT("server-1"),   // LocalPeerId
     TEXT("0.0.0.0"),    // ListenIp
     16000,              // ListenPort  (already offset)
-    2,                  // NumServers
     Peers               // PeerAddresses (already offset)
 );
 ```
@@ -416,7 +414,6 @@ The MultiServer beacon host listens for incoming connections indefinitely after 
 -DedicatedServerId=server-3
 -MultiServerListenPort=15000
 -MultiServerPeers=192.168.1.10:15000,192.168.1.11:15000
--MultiServerNumServers=3
 -DSTMGuidSeed=300000
 ```
 
@@ -452,7 +449,7 @@ If a server crashes and restarts with the same `-DedicatedServerId`, it can reco
 NumAcknowledgedPeers >= (NumExpectedServers - 1)
 ```
 
-where `NumExpectedServers` is set **once** from `-MultiServerNumServers=` at mesh creation time and never updated. This has implications for dynamic meshes:
+where `NumExpectedServers` is derived **once** from `PeerAddresses.Num() + 1` at mesh creation time and never updated. This has implications for dynamic meshes:
 
 | Scenario | `AreAllPeersConnected()` behavior |
 |----------|-----------------------------------|
@@ -561,9 +558,7 @@ A serialization version mismatch between the two servers. Both server binaries m
 
 ### DSTM mesh created but `AreAllPeersConnected()` never returns `true`
 
-Verify that `-MultiServerNumServers=` matches the actual number of servers in the cluster. The check uses `NumAcknowledgedPeers >= (NumExpectedServers - 1)`, so the value should be the **total** number of servers (including this one), not the number of peers.
-
-If you omit `-MultiServerNumServers=`, the default falls back to `PeerAddresses.Num()` which may be incorrect.
+`AreAllPeersConnected()` is a startup readiness check: it waits until all peers listed in `-MultiServerPeers=` have connected and exchanged IDs. If the peer list is correct but the check never passes, verify network connectivity and that each peer's beacon listener port is reachable.
 
 **In dynamic meshes** where servers join and leave, `AreAllPeersConnected()` becomes unreliable after a server departure — `NumExpectedServers` never decreases, so the check stays `false` permanently. Use `GetConnectedPeerCount() > 0` or `GetConnectedPeerIds()` instead. See [Runtime Scaling](#runtime-scaling).
 
