@@ -444,20 +444,71 @@ When a server shuts down or crashes:
 
 Migration attempts to a disconnected server will fail gracefully with a `"No beacon connection to destination server"` error. The remaining mesh continues to function normally for all other connected peers.
 
+### Server rejoin (crash recovery)
+
+If a server crashes and restarts with the same `-DedicatedServerId`, it can reconnect to the mesh by initiating outbound connections to existing servers. `HandlePeerConnected()` detects the returning peer ID, unbinds delegates from the old (now-destroyed) beacon, and binds to the new one. The routing tables are updated in place — no stale state accumulates.
+
+### `AreAllPeersConnected()` caveats
+
+`AreAllPeersConnected()` delegates to `UMultiServerNode::AreAllServersConnected()`, which checks:
+
+```
+NumAcknowledgedPeers >= (NumExpectedServers - 1)
+```
+
+where `NumExpectedServers` is set **once** from `-MultiServerNumServers=` at mesh creation time and never updated. This has implications for dynamic meshes:
+
+| Scenario | `AreAllPeersConnected()` behavior |
+|----------|-----------------------------------|
+| All original peers connected | Returns `true` (normal) |
+| Extra server joins (wasn't counted) | Still returns `true` — uses `>=` |
+| Server leaves (crash/shutdown) | Returns `false` and **stays false** — `NumExpectedServers` never decreases |
+| Server leaves then rejoins | Returns `true` again once peer count is restored |
+
+**For dynamic meshes, prefer `GetConnectedPeerCount()` and `GetConnectedPeerIds()` over `AreAllPeersConnected()`.** These methods reflect the actual live peer set rather than comparing against a fixed count.
+
+```cpp
+UDSTMSubsystem* DSTM = GetGameInstance()->GetSubsystem<UDSTMSubsystem>();
+
+// Dynamic mesh: use peer count instead of AreAllPeersConnected()
+int32 PeerCount = DSTM->GetConnectedPeerCount();
+if (PeerCount > 0)
+{
+    // At least one peer is available for migration
+}
+
+// Or check for a specific peer
+TArray<FString> PeerIds = DSTM->GetConnectedPeerIds();
+if (PeerIds.Contains(TEXT("server-2")))
+{
+    // server-2 is connected and ready
+}
+```
+
 ### Monitoring peer status
 
 ```cpp
 UDSTMSubsystem* DSTM = GetGameInstance()->GetSubsystem<UDSTMSubsystem>();
 
-// Check if initial peers are connected
+// Fixed mesh: check if initial peers are connected
 bool bReady = DSTM->AreAllPeersConnected();
 
-// Get current peer count (valid/connected only)
+// Dynamic mesh: get current peer count (valid/connected only)
 int32 PeerCount = DSTM->GetConnectedPeerCount();
 
 // Get the IDs of all currently connected peers
 TArray<FString> PeerIds = DSTM->GetConnectedPeerIds();
 ```
+
+### MultiServer Proxy limitations
+
+The MultiServer Proxy (`UProxyNetDriver`) is **not dynamic**. Its game server list is parsed from `-ProxyGameServers=` at initialization and cannot be changed at runtime. There is no engine API to register or unregister game servers after `InitBase()`. This means:
+
+- All backend game servers must be listed in the proxy's startup command line
+- Adding a new game server requires restarting the proxy
+- If a game server crashes, clients routed to it will be disconnected (the proxy detects the closed connection and cleans up routes)
+
+This is an engine-level limitation in UE 5.7's `UProxyNetDriver`. Dynamic proxy scaling would require Epic to add runtime `RegisterGameServer()` / `UnregisterGameServer()` support.
 
 ### Orchestration notes
 
@@ -514,7 +565,11 @@ A serialization version mismatch between the two servers. Both server binaries m
 
 ### DSTM mesh created but `AreAllPeersConnected()` never returns `true`
 
-Verify that `-MultiServerNumServers=` matches the actual number of servers minus one (or the number of distinct peers each server should connect to). If you omit this argument, the default is `1`, so a two-server cluster will report all peers connected as soon as one peer connects—even if additional peers are expected.
+Verify that `-MultiServerNumServers=` matches the actual number of servers in the cluster. The check uses `NumAcknowledgedPeers >= (NumExpectedServers - 1)`, so the value should be the **total** number of servers (including this one), not the number of peers.
+
+If you omit `-MultiServerNumServers=`, the default falls back to `PeerAddresses.Num()` which may be incorrect.
+
+**In dynamic meshes** where servers join and leave, `AreAllPeersConnected()` becomes unreliable after a server departure — `NumExpectedServers` never decreases, so the check stays `false` permanently. Use `GetConnectedPeerCount() > 0` or `GetConnectedPeerIds()` instead. See [Runtime Scaling](#runtime-scaling).
 
 ### `Reassigning NetGUID` warnings / `ObjectReplicatorReceivedBunchFail` crashes
 

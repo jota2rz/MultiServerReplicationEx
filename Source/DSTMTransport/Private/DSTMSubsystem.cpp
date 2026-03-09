@@ -444,6 +444,25 @@ void UDSTMSubsystem::HandlePeerConnected(
 		return;
 	}
 
+	// Handle server rejoin: if this peer was previously connected (e.g. after
+	// a crash/restart), unbind delegates from the old beacon to prevent
+	// duplicate migration callbacks. The old beacon actor may already be
+	// destroyed, but RemoveAll is safe on dead objects.
+	if (TObjectPtr<ADSTMBeaconClient>* OldBeaconPtr = PeerBeacons.Find(RemotePeerId))
+	{
+		ADSTMBeaconClient* OldBeacon = OldBeaconPtr->Get();
+		if (OldBeacon && OldBeacon != DSTMBeacon)
+		{
+			UE_LOG(LogDSTMSub, Log,
+				TEXT("DSTM peer '%s' reconnected — unbinding delegates from previous beacon"),
+				*RemotePeerId);
+#if UE_WITH_REMOTE_OBJECT_HANDLE
+			OldBeacon->OnMigrationDataReceived.RemoveAll(this);
+			OldBeacon->OnMigrationRequested.RemoveAll(this);
+#endif
+		}
+	}
+
 	PeerBeacons.Add(RemotePeerId, DSTMBeacon);
 
 	// Store reverse lookup: hash → peer ID string.
