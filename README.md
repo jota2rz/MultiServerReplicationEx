@@ -47,10 +47,10 @@ The plugin consists of three cooperating classes:
 ## Architecture
 
 ```
-Server-A                        Beacon Mesh                      Server-B
-────────                        ───────────                      ────────
+Server-A                              Beacon Mesh              Server-B
+────────                              ───────────              ────────
 TransferActorToServer(PC)
-  └─► TransferObjectOwnership   [serialize Actor + subobjects]
+  └─► TransferObjectOwnership
         ToRemoteServer()
             │
             ▼
@@ -58,21 +58,24 @@ TransferActorToServer(PC)
   (bound by DSTMTransportModule)
             │
             ▼
-  HandleOutgoingMigration()     ──Serialize FRemoteObjectData──►
-  [FMemoryWriter → TArray<u8>]     ServerReceiveMigratedObject()
-                                   or ClientReceiveMigratedObject()
-                                        │
-                                        ▼
-                                  HandleIncomingMigrationData()
-                                  [FMemoryReader ← TArray<u8>]
-                                        │
-                                        ▼
-                                  OnObjectDataReceived()
-                                  [engine DSTM receive pipeline]
-                                        │
-                                        ▼
-                                  AActor::PostMigrate(Receive)
-                                  APlayerController::PostMigrate(Receive)
+  HandleOutgoingMigration()
+  [FMemoryWriter → TArray<u8>]
+            │
+            └──── beacon RPC ────►
+                                      ServerReceive/           Beacon receives
+                                      ClientReceive            migration data
+                                      MigratedObject()               │
+                                                                     ▼
+                                                         HandleIncomingMigrationData()
+                                                         [FMemoryReader ← TArray<u8>]
+                                                                     │
+                                                                     ▼
+                                                         OnObjectDataReceived()
+                                                         [engine DSTM receive pipeline]
+                                                                     │
+                                                                     ▼
+                                                         AActor::PostMigrate(Receive)
+                                                         APlayerController::PostMigrate(Receive)
 ```
 
 The DSTM beacon mesh is a separate `UMultiServerNode` instance from any game-level multi-server mesh. It listens on a port offset (+1000 by default) from the main MultiServer mesh, keeping the transport concern isolated inside the plugin.
