@@ -99,6 +99,37 @@ public:
 		uint64 ObjectIdRaw,
 		uint32 RequestingServerIdRaw);
 
+	// ──── Chunked Migration Transfer RPCs ────
+	// UE replication limits TArray<uint8> RPC params to 65535 elements.
+	// Large actors (e.g. pawns with components) can exceed this.
+	// These RPCs split the payload into chunks and reassemble on receive.
+
+	/** Server RPC: send one chunk of a large migration payload. */
+	UFUNCTION(Server, Reliable)
+	void ServerReceiveMigratedObjectChunk(
+		uint64 ObjectIdRaw,
+		uint32 OwnerServerIdRaw,
+		uint32 PhysicsServerIdRaw,
+		uint32 PhysicsLocalIslandId,
+		uint32 SenderServerIdRaw,
+		int32 ChunkIndex,
+		int32 TotalChunks,
+		int32 TotalSize,
+		const TArray<uint8>& ChunkData);
+
+	/** Client RPC: send one chunk of a large migration payload. */
+	UFUNCTION(Client, Reliable)
+	void ClientReceiveMigratedObjectChunk(
+		uint64 ObjectIdRaw,
+		uint32 OwnerServerIdRaw,
+		uint32 PhysicsServerIdRaw,
+		uint32 PhysicsLocalIslandId,
+		uint32 SenderServerIdRaw,
+		int32 ChunkIndex,
+		int32 TotalChunks,
+		int32 TotalSize,
+		const TArray<uint8>& ChunkData);
+
 	// ──── Delegates ────
 
 	DECLARE_MULTICAST_DELEGATE_SixParams(FOnMigrationDataReceived,
@@ -118,4 +149,34 @@ public:
 
 	/** Fired when a peer requests us to send them an object. */
 	FOnMigrationRequested OnMigrationRequested;
+
+	// ──── Chunk Reassembly ────
+
+	struct FChunkAssembly
+	{
+		uint32 OwnerServerIdRaw = 0;
+		uint32 PhysicsServerIdRaw = 0;
+		uint32 PhysicsLocalIslandId = 0;
+		uint32 SenderServerIdRaw = 0;
+		int32 TotalChunks = 0;
+		int32 TotalSize = 0;
+		int32 ChunksReceived = 0;
+		TArray<uint8> ReassembledData;
+	};
+
+	/** Pending chunk reassembly buffers, keyed by ObjectIdRaw. */
+	TMap<uint64, FChunkAssembly> PendingChunks;
+
+private:
+	/** Process a received chunk and fire delegate when all chunks arrive. */
+	void HandleReceivedChunk(
+		uint64 ObjectIdRaw,
+		uint32 OwnerServerIdRaw,
+		uint32 PhysicsServerIdRaw,
+		uint32 PhysicsLocalIslandId,
+		uint32 SenderServerIdRaw,
+		int32 ChunkIndex,
+		int32 TotalChunks,
+		int32 TotalSize,
+		const TArray<uint8>& ChunkData);
 };

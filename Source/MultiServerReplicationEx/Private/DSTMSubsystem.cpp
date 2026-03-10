@@ -356,27 +356,76 @@ void UDSTMSubsystem::HandleOutgoingMigration(
 	// Send via the appropriate RPC direction based on beacon authority
 	const uint32 LocalServerId = FRemoteServerId::GetLocalServerId().GetIdNumber();
 
-	if (Beacon->IsAuthorityBeacon())
+	// UE replication limits TArray<uint8> RPC params to 65535 elements.
+	// If the payload exceeds this, send via chunked RPCs instead.
+	static constexpr int32 MaxChunkSize = 60000; // Safe margin below 65535 limit
+
+	if (SerializedData.Num() > MaxChunkSize)
 	{
-		// We are the server side of this beacon connection → use Client RPC
-		Beacon->ClientReceiveMigratedObject(
-			Ctx.ObjectId.GetIdNumber(),
-			Ctx.OwnerServerId.GetIdNumber(),
-			Ctx.PhysicsServerId.GetIdNumber(),
-			Ctx.PhysicsLocalIslandId,
-			LocalServerId,
-			SerializedData);
+		// ── Chunked transfer ──
+		const int32 TotalSize = SerializedData.Num();
+		const int32 TotalChunks = FMath::DivideAndRoundUp(TotalSize, MaxChunkSize);
+
+		UE_LOG(LogDSTMSub, Log,
+			TEXT("DSTM Send: Payload %d bytes exceeds RPC limit — splitting into %d chunks of %d bytes"),
+			TotalSize, TotalChunks, MaxChunkSize);
+
+		for (int32 i = 0; i < TotalChunks; ++i)
+		{
+			const int32 Offset = i * MaxChunkSize;
+			const int32 ThisChunkSize = FMath::Min(MaxChunkSize, TotalSize - Offset);
+
+			TArray<uint8> ChunkData;
+			ChunkData.SetNumUninitialized(ThisChunkSize);
+			FMemory::Memcpy(ChunkData.GetData(), SerializedData.GetData() + Offset, ThisChunkSize);
+
+			if (Beacon->IsAuthorityBeacon())
+			{
+				Beacon->ClientReceiveMigratedObjectChunk(
+					Ctx.ObjectId.GetIdNumber(),
+					Ctx.OwnerServerId.GetIdNumber(),
+					Ctx.PhysicsServerId.GetIdNumber(),
+					Ctx.PhysicsLocalIslandId,
+					LocalServerId,
+					i, TotalChunks, TotalSize,
+					ChunkData);
+			}
+			else
+			{
+				Beacon->ServerReceiveMigratedObjectChunk(
+					Ctx.ObjectId.GetIdNumber(),
+					Ctx.OwnerServerId.GetIdNumber(),
+					Ctx.PhysicsServerId.GetIdNumber(),
+					Ctx.PhysicsLocalIslandId,
+					LocalServerId,
+					i, TotalChunks, TotalSize,
+					ChunkData);
+			}
+		}
 	}
 	else
 	{
-		// We are the client side → use Server RPC
-		Beacon->ServerReceiveMigratedObject(
-			Ctx.ObjectId.GetIdNumber(),
-			Ctx.OwnerServerId.GetIdNumber(),
-			Ctx.PhysicsServerId.GetIdNumber(),
-			Ctx.PhysicsLocalIslandId,
-			LocalServerId,
-			SerializedData);
+		// ── Single RPC (payload fits within limit) ──
+		if (Beacon->IsAuthorityBeacon())
+		{
+			Beacon->ClientReceiveMigratedObject(
+				Ctx.ObjectId.GetIdNumber(),
+				Ctx.OwnerServerId.GetIdNumber(),
+				Ctx.PhysicsServerId.GetIdNumber(),
+				Ctx.PhysicsLocalIslandId,
+				LocalServerId,
+				SerializedData);
+		}
+		else
+		{
+			Beacon->ServerReceiveMigratedObject(
+				Ctx.ObjectId.GetIdNumber(),
+				Ctx.OwnerServerId.GetIdNumber(),
+				Ctx.PhysicsServerId.GetIdNumber(),
+				Ctx.PhysicsLocalIslandId,
+				LocalServerId,
+				SerializedData);
+		}
 	}
 
 	UE_LOG(LogDSTMSub, Log,
