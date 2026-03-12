@@ -1,8 +1,14 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "MultiServerProxy.h"
-#include "ProxyRegistrationBeaconHostObject.h"
-#include "OnlineBeaconHost.h"
+#include "DSTMSubsystem.h"
+#include "HttpServerModule.h"
+#include "IHttpRouter.h"
+#include "HttpServerRequest.h"
+#include "HttpServerResponse.h"
+#include "HttpModule.h"
+#include "Interfaces/IHttpRequest.h"
+#include "Interfaces/IHttpResponse.h"
 #include "UnrealEngine.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/GameInstance.h"
@@ -1030,6 +1036,15 @@ void UProxyNetDriver::NotifyActorChannelOpen(UActorChannel* Channel, AActor* Act
 
 void UProxyNetDriver::AddNetworkActor(AActor* Actor)
 {
+	// Only apply the proxy role-downgrade logic to actors owned by THIS net driver.
+	// Other drivers (e.g. BeaconDriverHost) also call AddNetworkActor via
+	// UWorld::AddNetworkActor's ForEachNetDriver, and we must not modify their actors.
+	if (Actor && Actor->GetNetDriverName() != NetDriverName)
+	{
+		Super::AddNetworkActor(Actor);
+		return;
+	}
+
 	// Ideally the proxy shouldn't spawn any actors since it's just used as a cache to pass state
 	// between game clients and game servers. For now though, actors that have the role ROLE_Authority
 	// will have replication disabled and the role set to ROLE_None. This stops them replicating to
@@ -1132,7 +1147,7 @@ bool UProxyNetDriver::CanDowngradeActorRole(UNetConnection* ProxyConnection, AAc
 
 void UProxyNetDriver::Shutdown()
 {
-	StopRegistrationBeacon();
+	StopRegistrationHTTP();
 
 	Super::Shutdown();
 
@@ -1145,60 +1160,184 @@ void UProxyNetDriver::Shutdown()
 	GameServerConnections.Reset();
 }
 
-void UProxyNetDriver::StartRegistrationBeacon(int32 Port)
+void UProxyNetDriver::StartRegistrationHTTP(int32 Port)
 {
-	UWorld* BeaconWorld = GetWorld();
-	if (!BeaconWorld)
+	RegistrationHTTPPort = Port;
+	RegistrationHTTPRouter = FHttpServerModule::Get().GetHttpRouter(Port, /*bFailOnBindFailure=*/true);
+	if (!RegistrationHTTPRouter)
 	{
-		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: no world"));
+		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationHTTP: failed to bind HTTP listener on port %d"), Port);
 		return;
 	}
 
-	RegistrationBeaconHost = BeaconWorld->SpawnActor<AProxyRegistrationBeaconHost>();
-	if (!RegistrationBeaconHost)
-	{
-		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: failed to spawn beacon host"));
-		return;
-	}
+	RegistrationRouteHandle = RegistrationHTTPRouter->BindRoute(
+		FHttpPath(TEXT("/register")),
+		EHttpServerRequestVerbs::VERB_POST,
+		FHttpRequestHandler::CreateLambda([this](const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete) -> bool
+		{
+			// Parse query params: GameServerAddress, DedicatedServerId, DSTMListenPort, GameMeshPort
+			const FString GameServerAddress = Request.QueryParams.FindRef(TEXT("address"));
+			const FString ServerId = Request.QueryParams.FindRef(TEXT("serverId"));
+			const FString DSTMPortStr = Request.QueryParams.FindRef(TEXT("dstmPort"));
 
-	RegistrationBeaconHost->ListenPort = Port;
+			if (GameServerAddress.IsEmpty())
+			{
+				UE_LOG(LogNetProxy, Error, TEXT("HTTP /register: missing 'address' param"));
+				OnComplete(FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest, TEXT(""), TEXT("Missing 'address' parameter")));
+				return true;
+			}
 
-	if (!RegistrationBeaconHost->InitHost())
-	{
-		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: InitHost failed on port %d"), Port);
-		RegistrationBeaconHost->Destroy();
-		RegistrationBeaconHost = nullptr;
-		return;
-	}
+			UE_LOG(LogNetProxy, Warning, TEXT("HTTP /register: server=%s addr=%s dstmPort=%s"),
+				*ServerId, *GameServerAddress, *DSTMPortStr);
 
-	RegistrationHostObject = BeaconWorld->SpawnActor<AProxyRegistrationBeaconHostObject>();
-	if (!RegistrationHostObject)
-	{
-		UE_LOG(LogNetProxy, Error, TEXT("StartRegistrationBeacon: failed to spawn host object"));
-		RegistrationBeaconHost->DestroyBeacon();
-		RegistrationBeaconHost = nullptr;
-		return;
-	}
+			// Derive DSTM address from game server host + DSTMListenPort
+			FString DSTMAddress;
+			FString Host, PortPart;
+			const bool bSplitOk = GameServerAddress.Split(TEXT(":"), &Host, &PortPart);
 
-	RegistrationBeaconHost->RegisterHost(RegistrationHostObject);
-	RegistrationBeaconHost->PauseBeaconRequests(false);
+			if (!DSTMPortStr.IsEmpty() && bSplitOk)
+			{
+				DSTMAddress = FString::Printf(TEXT("%s:%s"), *Host, *DSTMPortStr);
+			}
 
-	UE_LOG(LogNetProxy, Log, TEXT("Registration beacon started on port %d"), Port);
+			// Collect existing peers BEFORE adding the new server
+			TArray<FString> ExistingDSTMPeers = RegisteredDSTMPeers;
+
+			// Register the game server with the proxy (same path as -ProxyGameServers)
+			FURL GameServerURL(nullptr, *GameServerAddress, ETravelType::TRAVEL_Absolute);
+			if (!GameServerURL.Valid)
+			{
+				UE_LOG(LogNetProxy, Error, TEXT("HTTP /register: invalid URL: %s"), *GameServerAddress);
+				OnComplete(FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest, TEXT(""), TEXT("Invalid server address")));
+				return true;
+			}
+
+			RegisterGameServerAndConnectClients(GameServerURL);
+
+			// Track the new DSTM peer
+			if (!DSTMAddress.IsEmpty())
+			{
+				RegisteredDSTMPeers.Add(DSTMAddress);
+			}
+
+			// Response: comma-separated list of existing DSTM peers
+			const FString ResponseBody = FString::Join(ExistingDSTMPeers, TEXT(","));
+			UE_LOG(LogNetProxy, Warning, TEXT("HTTP /register: responding with %d DSTM peer(s)"),
+				ExistingDSTMPeers.Num());
+
+			OnComplete(FHttpServerResponse::Create(ResponseBody, TEXT("text/plain")));
+			return true;
+		})
+	);
+
+	FHttpServerModule::Get().StartAllListeners();
+	UE_LOG(LogNetProxy, Log, TEXT("HTTP registration listener started on port %d"), Port);
 }
 
-void UProxyNetDriver::StopRegistrationBeacon()
+void UProxyNetDriver::StopRegistrationHTTP()
 {
-	if (RegistrationHostObject)
+	if (RegistrationHTTPRouter && RegistrationRouteHandle.IsValid())
 	{
-		RegistrationHostObject->Destroy();
-		RegistrationHostObject = nullptr;
+		RegistrationHTTPRouter->UnbindRoute(RegistrationRouteHandle);
 	}
 
-	if (RegistrationBeaconHost)
+	if (RegistrationHTTPPort > 0)
 	{
-		RegistrationBeaconHost->DestroyBeacon();
-		RegistrationBeaconHost = nullptr;
+		FHttpServerModule::Get().StopAllListeners();
+		RegistrationHTTPPort = 0;
 	}
+
+	RegistrationHTTPRouter.Reset();
+}
+
+void UProxyNetDriver::JoinProxyHTTP(UWorld* World)
+{
+	FString JoinProxyAddr;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("-JoinProxy="), JoinProxyAddr, false))
+	{
+		return;
+	}
+
+	// Parse game server info from command line
+	FString GameServerAddr;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("-GameServerAddress="), GameServerAddr, false))
+	{
+		const int32 Port = World ? World->URL.Port : 7777;
+		GameServerAddr = FString::Printf(TEXT("127.0.0.1:%d"), Port);
+	}
+
+	FString DedicatedServerId;
+	FParse::Value(FCommandLine::Get(), TEXT("-DedicatedServerId="), DedicatedServerId, false);
+
+	int32 DSTMPort = 16000;
+	FParse::Value(FCommandLine::Get(), TEXT("-DSTMListenPort="), DSTMPort);
+
+	// Build the HTTP URL
+	const FString URL = FString::Printf(
+		TEXT("http://%s/register?address=%s&serverId=%s&dstmPort=%d"),
+		*JoinProxyAddr, *GameServerAddr, *DedicatedServerId, DSTMPort);
+
+	UE_LOG(LogNetProxy, Warning, TEXT("JoinProxyHTTP: POST %s"), *URL);
+
+	// Fire HTTP POST to the proxy's registration endpoint
+	TSharedRef<IHttpRequest> HttpRequest = FHttpModule::Get().CreateRequest();
+	HttpRequest->SetVerb(TEXT("POST"));
+	HttpRequest->SetURL(URL);
+
+	// Prevent crash if World is destroyed before callback — capture a weak pointer
+	TWeakObjectPtr<UWorld> WeakWorld(World);
+
+	HttpRequest->OnProcessRequestComplete().BindLambda(
+		[WeakWorld, DedicatedServerId, DSTMPort](FHttpRequestPtr Request, FHttpResponsePtr Response, bool bSuccess)
+		{
+			if (!bSuccess || !Response.IsValid() || Response->GetResponseCode() != 200)
+			{
+				UE_LOG(LogNetProxy, Error, TEXT("JoinProxyHTTP: registration failed (success=%d, code=%d)"),
+					bSuccess, Response.IsValid() ? Response->GetResponseCode() : 0);
+				return;
+			}
+
+			const FString ResponseBody = Response->GetContentAsString();
+			UE_LOG(LogNetProxy, Warning, TEXT("JoinProxyHTTP: registered successfully, DSTM peers: [%s]"), *ResponseBody);
+
+			// Parse comma-separated DSTM peer list
+			TArray<FString> PeerAddresses;
+			if (!ResponseBody.IsEmpty())
+			{
+				ResponseBody.ParseIntoArray(PeerAddresses, TEXT(","), true);
+			}
+
+			// Initialize DSTM mesh with peers from the proxy
+			UWorld* W = WeakWorld.Get();
+			if (!W) return;
+
+			UGameInstance* GI = W->GetGameInstance();
+			if (!GI) return;
+
+			UDSTMSubsystem* DSTM = GI->GetSubsystem<UDSTMSubsystem>();
+			if (!DSTM)
+			{
+				UE_LOG(LogNetProxy, Error, TEXT("JoinProxyHTTP: DSTMSubsystem not found"));
+				return;
+			}
+
+			if (DSTM->IsMeshActive())
+			{
+				UE_LOG(LogNetProxy, Log, TEXT("JoinProxyHTTP: DSTM mesh already active — ignoring proxy peer list"));
+				return;
+			}
+
+			FString ListenIp = TEXT("0.0.0.0");
+			FParse::Value(FCommandLine::Get(), TEXT("-DSTMListenIp="), ListenIp, false);
+
+			UE_LOG(LogNetProxy, Warning,
+				TEXT("JoinProxyHTTP: creating DSTM mesh — Id=%s, ListenPort=%d, Peers=%d"),
+				*DedicatedServerId, DSTMPort, PeerAddresses.Num());
+
+			DSTM->InitializeDSTMMesh(DedicatedServerId, ListenIp, DSTMPort, PeerAddresses);
+		});
+
+	HttpRequest->ProcessRequest();
 }
 
 void UProxyNetDriver::TickFlush(float DeltaSeconds)

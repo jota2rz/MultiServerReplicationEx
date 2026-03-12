@@ -4,7 +4,7 @@ Extended fork of UE 5.7's `MultiServerReplication` engine plugin with **dynamic 
 
 This plugin combines two concerns into a single module:
 
-1. **Proxy fixes** — adds and removes game servers at runtime, detects game server crashes
+1. **Proxy fixes** — adds and removes game servers at runtime, detects game server crashes, HTTP-based dynamic registration
 2. **DSTM transport** — replaces the engine's default disk-based migration transport with a real-time beacon mesh, enabling servers to push serialized actors directly to each other over the network without the client disconnecting
 
 ## Contents
@@ -25,7 +25,7 @@ This plugin combines two concerns into a single module:
 - [GUID Seed (Not Needed with DSTM)](#guid-seed-not-needed-with-dstm)
 - [Runtime Scaling](#runtime-scaling)
 - [Dynamic Proxy](#dynamic-proxy)
-- [Dynamic Proxy Registration (Beacon)](#dynamic-proxy-registration-beacon)
+- [Dynamic Proxy Registration (HTTP)](#dynamic-proxy-registration-http)
 - [Tip: Seamless Transfer with a Custom CMC](#tip-seamless-transfer-with-a-custom-cmc)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
@@ -45,9 +45,8 @@ The plugin consists of these cooperating classes:
 | `FMultiServerReplicationExModule` | Module startup: initializes the server's `FRemoteServerId` and pre-binds the engine transport delegates |
 | `UDSTMSubsystem` | Runtime: manages the DSTM beacon mesh, routes outgoing and incoming migration data, handles pull-requests |
 | `ADSTMBeaconClient` | Network: extends `AMultiServerBeaconClient` with reliable RPCs that carry serialized `FRemoteObjectData` |
-| `UProxyNetDriver` | Proxy: routes clients to multiple game servers (extended with dynamic add/remove/crash detection) |
-| `AProxyRegistrationBeaconClient` | Beacon client: game servers use this to register with the proxy at runtime |
-| `AProxyRegistrationBeaconHostObject` | Beacon host object: runs on the proxy, accepts game server registrations |
+| `UProxyNetDriver` | Proxy: routes clients to multiple game servers (extended with dynamic add/remove/crash detection, HTTP registration) |
+| `UProxyRegistrationSubsystem` | `UWorldSubsystem`: auto-detects `-ProxyRegistrationPort=` or `-JoinProxy=` on world begin play and activates the HTTP registration path — no game code needed |
 
 ---
 
@@ -118,15 +117,18 @@ ProxyNetDriver->OnGameServerDisconnected.AddLambda(
 
 The DSTM transport classes (`UDSTMSubsystem`, `ADSTMBeaconClient`) and the module startup code (server identity initialization, transport delegate binding) are built into the `MultiServerReplicationEx` module. No separate plugin is needed.
 
-### Proxy Fix 4: Dynamic game server registration via beacon
+### Proxy Fix 4: Dynamic game server registration via HTTP
 
 ```cpp
 // UProxyNetDriver (public)
-void StartRegistrationBeacon(int32 Port);
-void StopRegistrationBeacon();
+void StartRegistrationHTTP(int32 Port);
+void StopRegistrationHTTP();
+static void JoinProxyHTTP(UWorld* World);
 ```
 
-Game servers can register with the proxy at runtime by connecting to a registration beacon instead of being listed statically in `-ProxyGameServers=`. The beacon uses `AProxyRegistrationBeaconClient` (game server side) and `AProxyRegistrationBeaconHostObject` (proxy side). The game server passes its listen address via `GetLoginOptions()`, and the proxy extracts it from the login URL and calls `RegisterGameServerAndConnectClients()`. See [Dynamic Proxy Registration (Beacon)](#dynamic-proxy-registration-beacon).
+Game servers can register with the proxy at runtime via HTTP instead of being listed statically in `-ProxyGameServers=`. The proxy starts an HTTP listener (`FHttpServerModule` / `IHttpRouter`) on the port specified by `-ProxyRegistrationPort=`. Game servers send an HTTP POST to the proxy's `/register` endpoint with their listen address, server ID, and DSTM port as query parameters. The proxy registers the game server via `RegisterGameServerAndConnectClients()` and responds with the DSTM peer addresses of all other registered servers so the new server can join the DSTM mesh.
+
+The entire flow is automated by `UProxyRegistrationSubsystem` — a `UWorldSubsystem` that detects the relevant command-line flags and activates the HTTP path on world begin play. No game code is needed. See [Dynamic Proxy Registration (HTTP)](#dynamic-proxy-registration-http).
 
 ---
 
@@ -154,12 +156,14 @@ Game servers can register with the proxy at runtime by connecting to a registrat
 
    Make sure the stock `MultiServerReplication` is **not** also enabled — the two plugins define overlapping classes.
 
-3. Add `MultiServerReplicationEx` to your game module's `PrivateDependencyModuleNames`:
+3. Add `MultiServerReplicationEx` to your game module's `PrivateDependencyModuleNames` (only needed if your game code directly references plugin classes like `UDSTMSubsystem`):
 
    ```cs
    // YourGame.Build.cs
    PrivateDependencyModuleNames.Add("MultiServerReplicationEx");
    ```
+
+   > **Note:** If you only use the plugin via command-line arguments and let `UProxyRegistrationSubsystem` handle registration automatically, you don't need this dependency.
 
 4. Use the `Ex` module name in any `-NetDriverOverrides` or class path references:
 
@@ -362,12 +366,13 @@ These arguments configure the proxy server that multiplexes player connections t
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `-ProxyGameServers=<addresses>` | No (proxy only) | Comma-separated list of backend game server addresses for **static** registration at startup. Supports port ranges (`127.0.0.1:7777-7778` expands to two entries). Not needed when using dynamic beacon registration. |
-| `-ProxyRegistrationPort=<int>` | No (proxy only) | Port for the **dynamic** registration beacon listener. Game servers connect to this beacon at runtime and register themselves automatically. See [Dynamic Proxy Registration (Beacon)](#dynamic-proxy-registration-beacon). |
+| `-ProxyRegistrationPort=<int>` | No (proxy only) | Port for the **dynamic** HTTP registration listener. Game servers POST to this endpoint at runtime and register themselves automatically. See [Dynamic Proxy Registration (HTTP)](#dynamic-proxy-registration-http). |
+| `-JoinProxy=<host:port>` | No (game server only) | Address of the proxy's HTTP registration endpoint. The game server sends an HTTP POST to register itself and receives DSTM peer addresses in the response. Parsed automatically by `UProxyRegistrationSubsystem`. |
 | `-NetDriverOverrides=<class>` | Yes (proxy only) | Must be set to `/Script/MultiServerReplicationEx.ProxyNetDriver` to activate the proxy. |
 | `ProxyClientPrimaryGameServer=<int\|random>` | No | Which game server index is the primary for each new client. Pass `random` for randomization. Defaults to `0`. |
 | `-ProxyCyclePrimaryGameServer` | No | Flag: after each client connects, advance `PrimaryGameServerForNextClient` to the next server (round-robin). |
 
-> **Note:** `-ProxyGameServers=` and `-ProxyRegistrationPort=` can be used together. Static servers are registered immediately at startup; additional servers can join later via the beacon. If neither is provided, the proxy starts with zero game servers and waits for beacon registrations.
+> **Note:** `-ProxyGameServers=` and `-ProxyRegistrationPort=` can be used together. Static servers are registered immediately at startup; additional servers can join later via HTTP. If neither is provided, the proxy starts with zero game servers and waits for HTTP registrations.
 
 ### Example (two-server cluster with proxy)
 
@@ -376,6 +381,10 @@ A complete local launch requires three kinds of arguments per game server:
 1. **Engine / game** — `-server -port=<game-port>`
 2. **Engine multi-server mesh** — `-MultiServerListenPort=<port> -MultiServerPeers=<peer-mesh-addresses>`
 3. **DSTM transport** — `-DedicatedServerId=<id> -DSTMListenPort=<port> -DSTMPeers=<peer-dstm-addresses>`
+
+When using dynamic HTTP registration (`-JoinProxy=`), items 2 and 3 are simplified because the DSTM peer list is discovered automatically from the proxy.
+
+#### Direct mode (no proxy, or proxy with static `-ProxyGameServers=`)
 
 ```
 # Server 1 (game 7777, engine mesh 15000, DSTM beacon 16000)
@@ -394,7 +403,29 @@ A complete local launch requires three kinds of arguments per game server:
 -NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
 -ProxyGameServers=127.0.0.1:7777,127.0.0.1:7778
 
-# Proxy — OPTION B: dynamic registration (servers register via beacon)
+# Proxy — OPTION B: dynamic registration (servers register via HTTP)
+-server -port=7780 -DisableGarbageElimination
+-DedicatedServerId=proxy-1
+-NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
+-ProxyRegistrationPort=17000
+```
+
+#### Dynamic HTTP mode (game servers discover DSTM peers via proxy)
+
+When using `-JoinProxy=`, game servers don't need `-DSTMPeers=` — the proxy returns peer addresses in the HTTP response:
+
+```
+# Server 1 (game 7777, DSTM beacon 16000, registers with proxy via HTTP)
+-server -port=7777 -DisableGarbageElimination
+-DedicatedServerId=server-1 -DSTMListenPort=16000
+-JoinProxy=127.0.0.1:17000
+
+# Server 2 (game 7778, DSTM beacon 16001, registers with proxy via HTTP)
+-server -port=7778 -DisableGarbageElimination
+-DedicatedServerId=server-2 -DSTMListenPort=16001
+-JoinProxy=127.0.0.1:17000
+
+# Proxy (HTTP registration listener on 17000)
 -server -port=7780 -DisableGarbageElimination
 -DedicatedServerId=proxy-1
 -NetDriverOverrides=/Script/MultiServerReplicationEx.ProxyNetDriver
@@ -407,9 +438,11 @@ A complete local launch requires three kinds of arguments per game server:
 | 15000–15001 | Engine multi-server mesh (server ↔ server beacons for replication) |
 | 16000–16001 | DSTM beacon mesh (server ↔ server beacons for migration transport) |
 | 7780 | Proxy listener (client ↔ proxy, UDP) |
-| 17000 | Proxy registration beacon (game server → proxy, TCP) — only when using `-ProxyRegistrationPort=` |
+| 17000 | Proxy HTTP registration (game server → proxy, TCP/HTTP) — only when using `-ProxyRegistrationPort=` |
 
 The proxy does **not** need DSTM mesh arguments (`-DSTMListenPort`, `-DSTMPeers`) — it forwards client traffic to game servers but does not participate in server-to-server migration. However, it **does** need `-DedicatedServerId=` and `-DisableGarbageElimination` because the global server identity must be initialized before the engine touches any remote object types.
+
+When using dynamic HTTP registration (`-ProxyRegistrationPort=` / `-JoinProxy=`), game servers do **not** need `-DSTMPeers=` — the DSTM peer list is discovered automatically from the proxy's HTTP response.
 
 ---
 
@@ -421,6 +454,8 @@ The proxy does **not** need DSTM mesh arguments (`-DSTMListenPort`, `-DSTMPeers`
 
 ### Calling from your Game Mode
 
+> **Note:** Proxy registration is handled automatically by `UProxyRegistrationSubsystem` and does **not** require any game code. You only need to call `InitializeFromCommandLine()` for the DSTM subsystem — and only when the server is **not** using `-JoinProxy=` (because `JoinProxyHTTP()` initializes the DSTM mesh automatically from the proxy's response).
+
 Call `InitializeFromCommandLine()` from your game mode's `StartPlay()` (or equivalent) once the world is ready:
 
 ```cpp
@@ -431,11 +466,21 @@ void AYourGameMode::StartPlay()
 {
     Super::StartPlay();
 
-    if (UGameInstance* GI = GetGameInstance())
+    // Proxy registration is handled automatically by UProxyRegistrationSubsystem.
+    // DSTM init is also automatic when using -JoinProxy= (peers come from the
+    // proxy HTTP response). Only call InitializeFromCommandLine() for direct
+    // peer-to-peer mode (using -DSTMPeers= without a proxy).
+
+    const bool bUsingProxy = FString(FCommandLine::Get()).Contains(TEXT("-JoinProxy="));
+
+    if (!bUsingProxy)
     {
-        if (UDSTMSubsystem* DSTM = GI->GetSubsystem<UDSTMSubsystem>())
+        if (UGameInstance* GI = GetGameInstance())
         {
-            DSTM->InitializeFromCommandLine();
+            if (UDSTMSubsystem* DSTM = GI->GetSubsystem<UDSTMSubsystem>())
+            {
+                DSTM->InitializeFromCommandLine();
+            }
         }
     }
 }
@@ -796,6 +841,8 @@ The MultiServer Proxy (`UProxyNetDriver`) is **fully dynamic** in this fork. Its
 - `OnGameServerDisconnected` delegate fires when a game server crashes or disconnects — `DetectGameServerDisconnections()` runs every `TickFlush()`
 - Clients that connect **after** a dynamic registration automatically get routes to the new server (the proxy iterates the full `GameServerConnections` array on each `NMT_Join`)
 - `UProxyNetDriver` is exported (`MULTISERVERREPLICATIONEX_API`) and can be subclassed by plugins
+- `UProxyRegistrationSubsystem` auto-activates HTTP registration from command-line flags — no game code needed
+- HTTP-registered game servers automatically receive DSTM peer addresses in the response, enabling zero-config DSTM mesh setup
 
 ### Orchestration notes
 
@@ -807,73 +854,60 @@ The automation of scaling decisions is **out of scope** for this plugin. An exte
 
 ---
 
-## Dynamic Proxy Registration (Beacon)
+## Dynamic Proxy Registration (HTTP)
 
-Instead of listing game servers statically with `-ProxyGameServers=`, the proxy can accept dynamic registrations over a beacon. Game servers connect to the proxy's registration beacon and announce their listen address. The proxy then calls `RegisterGameServerAndConnectClients()` — the same code path as static registration — so existing clients get routes to the new server immediately.
+Instead of listing game servers statically with `-ProxyGameServers=`, the proxy can accept dynamic registrations over HTTP. Game servers send an HTTP POST to the proxy with their listen address, DSTM port, and server ID. The proxy registers the game server via `RegisterGameServerAndConnectClients()` — the same code path as static registration — so existing clients get routes to the new server immediately. The proxy also returns the DSTM peer addresses of all other registered servers, enabling the new game server to join the DSTM mesh automatically.
+
+### Automatic activation via `UProxyRegistrationSubsystem`
+
+All proxy registration logic is handled automatically by `UProxyRegistrationSubsystem`, a `UWorldSubsystem` built into the plugin. It detects the relevant command-line flags and activates the correct HTTP path on world begin play:
+
+- **Proxy process** with `-ProxyRegistrationPort=<port>`: calls `UProxyNetDriver::StartRegistrationHTTP()` to start the HTTP listener.
+- **Game server process** with `-JoinProxy=<host:port>`: calls `UProxyNetDriver::JoinProxyHTTP()` to send an HTTP POST to the proxy.
+
+**No game code is required.** The subsystem is only created on dedicated servers that have one of these flags.
 
 ### Proxy side
 
-Start the registration beacon listener by passing `-ProxyRegistrationPort=<port>` on the proxy's command line. Your game code must parse this argument and call `StartRegistrationBeacon()` on the proxy net driver:
+Pass `-ProxyRegistrationPort=<port>` on the proxy's command line. The subsystem calls `StartRegistrationHTTP()`, which binds a POST handler on `/register` using `FHttpServerModule` / `IHttpRouter`.
 
-```cpp
-// YourGameMode.cpp — called from StartPlay() or equivalent
-UProxyNetDriver* ProxyDriver = Cast<UProxyNetDriver>(GetWorld()->GetNetDriver());
-if (ProxyDriver)
-{
-    int32 RegistrationPort = 0;
-    if (FParse::Value(FCommandLine::Get(), TEXT("-ProxyRegistrationPort="), RegistrationPort))
-    {
-        ProxyDriver->StartRegistrationBeacon(RegistrationPort);
-    }
-}
-```
+When a game server POSTs to `/register?address=<host:port>&serverId=<id>&dstmPort=<port>`, the handler:
+1. Extracts the `address`, `serverId`, and `dstmPort` query parameters
+2. Calls `RegisterGameServerAndConnectClients()` to add the game server to the proxy
+3. Stores the game server's DSTM address (`host:dstmPort`) in `RegisteredDSTMPeers`
+4. Returns a single-line response containing the comma-separated DSTM peer addresses of all *other* registered servers
 
-`StartRegistrationBeacon()` spawns an `AProxyRegistrationBeaconHost` (which enables the NMT_Login handshake so the login URL is populated) and an `AProxyRegistrationBeaconHostObject` that extracts the game server address from the login options.
-
-The beacon is automatically stopped during `UProxyNetDriver::Shutdown()`.
+The HTTP listener is automatically stopped during `UProxyNetDriver::Shutdown()`.
 
 ### Game server side
 
-Each game server connects to the proxy's registration beacon and passes its own listen address:
-
-```cpp
-// YourGameMode.cpp — called from StartPlay() when not running as proxy
-
-// Determine this server's listen address
-FString GameServerAddress = FString::Printf(TEXT("127.0.0.1:%d"), GetWorld()->URL.Port);
-
-// Parse the proxy beacon address from command line
-// (your game code decides how to pass this — could be a custom arg or config)
-FString ProxyBeaconAddress; // e.g. "127.0.0.1:17000"
-
-AProxyRegistrationBeaconClient* BeaconClient =
-    GetWorld()->SpawnActor<AProxyRegistrationBeaconClient>();
-if (BeaconClient)
-{
-    BeaconClient->SetGameServerAddress(GameServerAddress);
-
-    FURL BeaconURL(nullptr, *ProxyBeaconAddress, ETravelType::TRAVEL_Absolute);
-    BeaconClient->InitClient(BeaconURL);
-}
-```
-
-The beacon client's `GetLoginOptions()` appends `?GameServerAddress=<host:port>` to the login URL. On the proxy side, `AProxyRegistrationBeaconHostObject::OnClientConnected()` extracts this from `Connection->RequestURL` and calls `HandleGameServerRegistration()`.
+Pass `-JoinProxy=<host:port>` on the game server's command line (e.g., `-JoinProxy=127.0.0.1:17000`). The subsystem calls `JoinProxyHTTP()`, which:
+1. Reads `-JoinProxy=`, `-DedicatedServerId=`, and `-DSTMListenPort=` from the command line
+2. Computes the game server's listen address from the world URL port
+3. Sends an async HTTP POST to `http://<proxy>/register?address=<addr>&serverId=<id>&dstmPort=<port>`
+4. On response, parses the comma-separated DSTM peer addresses
+5. Initializes the DSTM mesh via `UDSTMSubsystem::InitializeDSTMMesh()` with the discovered peers
 
 ### How it works
 
-1. Game server spawns `AProxyRegistrationBeaconClient`, sets its listen address, connects to proxy beacon
-2. Beacon handshake completes (NMT_Login with `bAuthRequired=true`, auto-approved)
-3. `OnClientConnected()` fires on the proxy — extracts `GameServerAddress` from the login URL
-4. `HandleGameServerRegistration()` looks up `UProxyNetDriver` and calls `RegisterGameServerAndConnectClients()`
-5. All existing proxy clients get routes to the new server; future clients get them on `NMT_Join`
+1. Proxy starts with `-ProxyRegistrationPort=17000` → `UProxyRegistrationSubsystem` calls `StartRegistrationHTTP(17000)`
+2. Game server starts with `-JoinProxy=127.0.0.1:17000` → `UProxyRegistrationSubsystem` calls `JoinProxyHTTP()`
+3. Game server POSTs to `http://127.0.0.1:17000/register?address=127.0.0.1:7777&serverId=server-1&dstmPort=16000`
+4. Proxy receives the POST, registers the game server, returns DSTM peers of other already-registered servers
+5. Game server parses the DSTM peer list and initializes its DSTM beacon mesh
+6. All existing proxy clients get routes to the new server; future clients get them on `NMT_Join`
 
 ### Combining static and dynamic registration
 
 You can use both modes together:
 - `-ProxyGameServers=127.0.0.1:7777` — server-1 is registered at startup
-- `-ProxyRegistrationPort=17000` — server-2, server-3, etc. register later via beacon
+- `-ProxyRegistrationPort=17000` — server-2, server-3, etc. register later via HTTP
 
 This is useful when some servers are always present (static) and others scale dynamically.
+
+### Why HTTP instead of beacons?
+
+The proxy world already contains a `UIpNetDriver` for client traffic. Adding a second `UIpNetDriver` for a beacon-based registration handshake causes UDP `StatelessConnectHandlerComponent` collisions — both drivers try to process the same inbound packets. HTTP avoids this entirely by using a separate TCP-based transport that does not conflict with the game's UDP net drivers.
 
 ---
 
@@ -1049,9 +1083,8 @@ At `MaxWalkSpeed = 600` UU/s with the defaults above:
 | `LogDSTM` | `FMultiServerReplicationExModule` — module startup, delegate binding, server identity |
 | `LogDSTMSub` | `UDSTMSubsystem` — mesh lifecycle, peer connections, migration send/receive |
 | `LogDSTMBeacon` | `ADSTMBeaconClient` — beacon RPC send/receive |
-| `LogNetProxy` | `UProxyNetDriver` — proxy lifecycle, game server registration, route management |
-| `LogProxyRegistrationHost` | `AProxyRegistrationBeaconHostObject` — beacon host, dynamic game server registration |
-| `LogProxyRegistrationClient` | `AProxyRegistrationBeaconClient` — beacon client, connection to proxy |
+| `LogNetProxy` | `UProxyNetDriver` — proxy lifecycle, game server registration, route management, HTTP registration |
+| `LogProxyRegistration` | `UProxyRegistrationSubsystem` — subsystem lifecycle, auto-detection of command-line flags |
 
 Enable verbose output:
 
@@ -1062,8 +1095,7 @@ LogDSTM=Verbose
 LogDSTMSub=Verbose
 LogDSTMBeacon=Verbose
 LogNetProxy=Verbose
-LogProxyRegistrationHost=Verbose
-LogProxyRegistrationClient=Verbose
+LogProxyRegistration=Verbose
 ```
 
 ---

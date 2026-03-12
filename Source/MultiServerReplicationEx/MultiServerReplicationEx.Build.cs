@@ -15,7 +15,9 @@ public class MultiServerReplicationEx : ModuleRules
                 "CoreOnline",
                 "Engine",
 				"NetCore",
-				"MultiServerConfigurationEx"
+				"MultiServerConfigurationEx",
+				"HTTP",
+				"HTTPServer"
             }
         );
 

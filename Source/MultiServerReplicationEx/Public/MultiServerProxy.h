@@ -10,8 +10,8 @@
 #include "IpConnection.h"
 #include "MultiServerProxy.generated.h"
 
-class AOnlineBeaconHost;
-class AProxyRegistrationBeaconHostObject;
+class IHttpRouter;
+struct FHttpRouteHandleInternal;
 
 /** Broadcast when a backend game server connection is lost (index, URL). */
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnGameServerDisconnected, int32 /*GameServerIndex*/, const FURL& /*GameServerURL*/);
@@ -342,11 +342,19 @@ public:
 	/** Unregister a game server, closing all routes and destroying the backend driver. */
 	void UnregisterGameServer(int32 GameServerIndex);
 
-	/** Start a beacon host that listens for dynamic game server registrations. */
-	void StartRegistrationBeacon(int32 Port);
+	/** Start an HTTP listener for dynamic game server registrations. */
+	void StartRegistrationHTTP(int32 Port);
 
-	/** Stop the registration beacon and clean up. */
-	void StopRegistrationBeacon();
+	/** Stop the HTTP registration listener and clean up. */
+	void StopRegistrationHTTP();
+
+	/**
+	 * Static utility: game servers call this to register with a proxy via HTTP POST.
+	 * Parses -JoinProxy=, -GameServerAddress=, -DSTMListenPort=, -DedicatedServerId=
+	 * from the command line. On success, initializes the DSTM mesh with peers from the response.
+	 * @param World  The game server's world (used to find DSTMSubsystem).
+	 */
+	static void JoinProxyHTTP(UWorld* World);
 
 	/** Broadcast when a backend game server connection is lost. */
 	FOnGameServerDisconnected OnGameServerDisconnected;
@@ -509,12 +517,15 @@ private:
 	// As a client connects to the proxy, randomize PrimaryGameServerForNextClient to one of the known game servers.
 	bool bRandomizePrimaryGameServerForNextClient = false;
 
-	/** Beacon host for dynamic game server registration (started with -ProxyRegistrationPort=). */
-	UPROPERTY()
-	TObjectPtr<AOnlineBeaconHost> RegistrationBeaconHost;
+	/** HTTP registration listener port (0 = not active). */
+	int32 RegistrationHTTPPort = 0;
 
-	UPROPERTY()
-	TObjectPtr<AProxyRegistrationBeaconHostObject> RegistrationHostObject;
+	/** Handle to the HTTP route so we can unbind on shutdown. */
+	TSharedPtr<IHttpRouter> RegistrationHTTPRouter;
+	TSharedPtr<const FHttpRouteHandleInternal> RegistrationRouteHandle;
+
+	/** Tracks DSTM peer addresses for dynamic peer discovery. */
+	TArray<FString> RegisteredDSTMPeers;
 };
 
 /** 
